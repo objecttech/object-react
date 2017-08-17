@@ -1,0 +1,74 @@
+(ns objecttech.chat.views.input.suggestions
+  (:require-macros [objecttech.utils.views :refer [defview]])
+  (:require [re-frame.core :refer [subscribe dispatch]]
+            [objecttech.components.react :refer [view
+                                                scroll-view
+                                                touchable-highlight
+                                                text
+                                                icon]]
+            [objecttech.data-store.messages :as messages]
+            [objecttech.chat.styles.input.suggestions :as style]
+            [objecttech.chat.constants :as const]
+            [objecttech.chat.views.input.animations.expandable :refer [expandable-view]]
+            [objecttech.chat.views.input.utils :as input-utils]
+            [objecttech.i18n :refer [label]]
+            [taoensso.timbre :as log]
+            [objecttech.chat.utils :as chat-utils]))
+
+(defn suggestion-item [{:keys [on-press name description last?]}]
+  [touchable-highlight {:on-press on-press}
+   [view (style/item-suggestion-container last?)
+    [view {:style style/item-suggestion-name}
+     [text {:style style/item-suggestion-name-text
+            :font  :roboto-mono} name]]
+    [text {:style           style/item-suggestion-description
+           :number-of-lines 2}
+     description]]])
+
+(defview request-item [{:keys [type message-id]} last?]
+  [{:keys [name description] :as response} [:get-response type]
+   {:keys [chat-id]} [:get-current-chat]]
+  [suggestion-item
+   {:on-press    #(let [{:keys [params]} (messages/get-message-content-by-id message-id)
+                        metadata (assoc params :to-message-id message-id)]
+                    (dispatch [:select-chat-input-command response metadata]))
+    :name        name
+    :description description
+    :last?       last?}])
+
+(defn command-item [{:keys [name description bot] :as command} last?]
+  [suggestion-item
+   {:on-press    #(dispatch [:select-chat-input-command command nil])
+    :name        (chat-utils/command-name command)
+    :description description
+    :last?       last?}])
+
+(defn item-title [top-padding? s]
+  [view (style/item-title-container top-padding?)
+   [text {:style style/item-title-text}
+    s]])
+
+(defview suggestions-view []
+  [show-suggestions? [:show-suggestions?]
+   requests [:chat :request-suggestions]
+   commands [:chat :command-suggestions]]
+  (when show-suggestions?
+    [expandable-view {:key        :suggestions
+                      :draggable? false
+                      :height     212}
+     [view {:flex 1}
+      [scroll-view {:keyboardShouldPersistTaps :always}
+       (when (seq requests)
+         [view
+          [item-title false (label :t/suggestions-requests)]
+          (for [[i {:keys [chat-id message-id] :as request}] (map-indexed vector requests)]
+            ^{:key [chat-id message-id]}
+            [request-item request (= i (dec (count requests)))])])
+       (when (seq commands)
+         [view
+          [item-title (seq requests) (label :t/suggestions-commands)]
+          (for [[i [_ command]] (->> commands
+                                     (remove #(nil? (:title (second %))))
+                                     (map-indexed vector))]
+            ^{:key i}
+            [command-item command (= i (dec (count commands)))])])]]]))

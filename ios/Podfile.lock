@@ -1,0 +1,12 @@
+PODS:
+  - Instabug (7.2.6)
+
+DEPENDENCIES:
+  - Instabug (~> 7.0)
+
+SPEC CHECKSUMS:
+  Instabug: 49d4fbf1bf14e2f9074dfb7774ca5611bae993b4
+
+PODFILE CHECKSUM: b75d6ec95102ddea68ad1e171f7f8f974533bac7
+
+COCOAPODS: 1.2.1

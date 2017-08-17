@@ -1,0 +1,395 @@
+(ns objecttech.protocol.handlers
+  (:require [objecttech.utils.handlers :as u]
+            [re-frame.core :refer [dispatch after]]
+            [objecttech.utils.handlers :refer [register-handler]]
+            [objecttech.data-store.contacts :as contacts]
+            [objecttech.data-store.messages :as messages]
+            [objecttech.data-store.pending-messages :as pending-messages]
+            [objecttech.data-store.processed-messages :as processed-messages]
+            [objecttech.data-store.chats :as chats]
+            [objecttech.protocol.core :as protocol]
+            [objecttech.constants :refer [text-content-type
+                                         blocks-per-hour]]
+            [objecttech.i18n :refer [label]]
+            [objecttech.utils.random :as random]
+            [objecttech.protocol.message-cache :as cache]
+            [objecttech.utils.datetime :as dt]
+            [taoensso.timbre :as log :refer-macros [debug]]
+            [objecttech.constants :as c]
+            [objecttech.components.object :as object]
+            [clojure.string :refer [join]]
+            [objecttech.utils.scheduler :as s]
+            [objecttech.utils.web3-provider :as w3]))
+
+(register-handler :initialize-protocol
+  (fn [db [_ current-account-id ethereum-rpc-url]]
+    (let [{:keys [public-key object updates-public-key
+                  updates-private-key]}
+          (get-in db [:accounts current-account-id])]
+      (if public-key
+        (let [rpc-url (or ethereum-rpc-url c/ethereum-rpc-url)
+              groups  (chats/get-active-group-chats)
+              web3    (w3/make-web3 rpc-url)]
+          (protocol/init-whisper!
+            {:web3                        web3
+             :identity                    public-key
+             :groups                      groups
+             :callback                    #(dispatch [:incoming-message %1 %2])
+             :ack-not-received-s-interval 125
+             :default-ttl                 120
+             :send-online-s-interval      180
+             :ttl-config                  {:public-group-message 2400}
+             :max-attempts-number         3
+             :delivery-loop-ms-interval   500
+             :profile-keypair             {:public  updates-public-key
+                                           :private updates-private-key}
+             :hashtags                    (u/get-hashtags object)
+             :pending-messages            (pending-messages/get-all)
+             :contacts                    (keep (fn [{:keys [whisper-identity
+                                                             public-key
+                                                             private-key]}]
+                                                  (when (and public-key private-key)
+                                                    {:identity whisper-identity
+                                                     :keypair  {:public  public-key
+                                                                :private private-key}}))
+                                                (contacts/get-all))
+             :post-error-callback         #(dispatch [::post-error %])})
+          (assoc db :web3 web3
+                    :rpc-url rpc-url))
+        db))))
+
+(register-handler :update-sync-state
+  (u/side-effect!
+    (fn [{:keys [sync-state sync-data]} [_ error sync]]
+      (let [{:keys [highestBlock currentBlock] :as state}
+            (js->clj sync :keywordize-keys true)
+            syncing?  (> (- highestBlock currentBlock) blocks-per-hour)
+            new-state (cond
+                        error :offline
+                        syncing? (if (= sync-state :done)
+                                   :pending
+                                   :in-progress)
+                        :else (if (or (= sync-state :done)
+                                      (= sync-state :pending))
+                                :done
+                                :synced))]
+        (when (and (not= sync-data state) (= :in-progress new-state))
+          (dispatch [:set :sync-data state]))
+        (when (not= sync-state new-state)
+          (dispatch [:set :sync-state new-state]))))))
+
+(register-handler :check-sync
+  (u/side-effect!
+    (fn [{:keys [web3] :as db}]
+      (if web3
+        (do (.getSyncing
+              (.-eth web3)
+              (fn [error sync]
+                (dispatch [:update-sync-state error sync])))
+            (s/execute-later #(dispatch [:check-sync]) (s/s->ms 10)))
+        (s/execute-later #(dispatch [:check-sync]) (s/s->ms 10))))))
+
+(register-handler :initialize-sync-listener
+  (fn [{:keys [sync-listening-started] :as db} _]
+    (if-not sync-listening-started
+      (do
+        (dispatch [:check-sync])
+        (assoc db :sync-listening-started true))
+      db)))
+
+(register-handler :incoming-message
+  (u/side-effect!
+    (fn [_ [_ type {:keys [payload ttl id] :as message}]]
+      (let [message-id (or id (:message-id payload))]
+        (when-not (cache/exists? message-id type)
+          (let [ttl-s             (* 1000 (or ttl 120))
+                processed-message {:id         (random/id)
+                                   :message-id message-id
+                                   :type       type
+                                   :ttl        (+ (dt/now-ms) ttl-s)}]
+            (cache/add! processed-message)
+            (processed-messages/save processed-message))
+          (case type
+            :message               (dispatch [:received-protocol-message! message])
+            :group-message         (dispatch [:received-protocol-message! message])
+            :public-group-message  (dispatch [:received-protocol-message! message])
+            :ack                   (if (#{:message :group-message} (:type payload))
+                                     (dispatch [:message-delivered message])
+                                     (dispatch [:pending-message-remove message]))
+            :seen                  (dispatch [:message-seen message])
+            :group-invitation      (dispatch [:group-chat-invite-received message])
+            :update-group          (dispatch [:update-group-message message])
+            :add-group-identity    (dispatch [:participant-invited-to-group message])
+            :remove-group-identity (dispatch [:participant-removed-from-group message])
+            :leave-group           (dispatch [:participant-left-group message])
+            :contact-request       (dispatch [:contact-request-received message])
+            :discover              (dispatch [:object-received message])
+            :discoveries-request   (dispatch [:discoveries-request-received message])
+            :discoveries-response  (dispatch [:discoveries-response-received message])
+            :profile               (dispatch [:contact-update-received message])
+            :update-keys           (dispatch [:update-keys-received message])
+            :online                (dispatch [:contact-online-received message])
+            :pending               (dispatch [:pending-message-upsert message])
+            :sent                  (let [{:keys [to id group-id]} message
+                                         message' {:from    to
+                                                   :payload {:message-id id
+                                                             :group-id   group-id}}]
+                                     (dispatch [:message-sent message']))
+            (debug "Unknown message type" type)))))))
+
+(defn system-message
+  ([message-id timestamp content]
+   {:from         "system"
+    :message-id   message-id
+    :timestamp    timestamp
+    :content      content
+    :content-type text-content-type}))
+
+(defn joined-chat-message [chat-id from message-id]
+  (let [contact-name (:name (contacts/get-by-id from))]
+    (messages/save chat-id {:from         "system"
+                            :message-id   (str message-id "_" from)
+                            :content      (str (or contact-name from) " " (label :t/received-invitation))
+                            :content-type text-content-type})))
+
+(defn participant-invited-to-group-message [chat-id current-identity identity from message-id timestamp]
+  (let [inviter-name (:name (contacts/get-by-id from))
+        invitee-name (if (= identity current-identity)
+                       (label :t/You)
+                       (:name (contacts/get-by-id identity)))]
+    {:from         "system"
+     :group-id     chat-id
+     :timestamp    timestamp
+     :message-id   message-id
+     :content      (str (or inviter-name from) " " (label :t/invited) " " (or invitee-name identity))
+     :content-type text-content-type}))
+
+(defn participant-removed-from-group-message
+  [identity from {:keys [message-id timestamp]}]
+  (let [remover-name (:name (contacts/get-by-id from))
+        removed-name (:name (contacts/get-by-id identity))]
+    (->> [(or remover-name from) (label :t/removed) (or removed-name identity)]
+         (join " ")
+         (system-message message-id timestamp))))
+
+(defn you-removed-from-group-message
+  [from {:keys [message-id timestamp]}]
+  (let [remover-name (:name (contacts/get-by-id from))]
+    (->> [(or remover-name from) (label :t/removed-from-chat)]
+         (join " ")
+         (system-message message-id timestamp))))
+
+(defn participant-left-group-message
+  [chat-id from {:keys [message-id timestamp]}]
+  (let [left-name (:name (contacts/get-by-id from))]
+    (->> (str (or left-name from) " " (label :t/left))
+         (system-message message-id timestamp)
+         (messages/save chat-id))))
+
+(register-handler :group-chat-invite-acked
+  (u/side-effect!
+    (fn [_ [action from group-id ack-message-id]]
+      (log/debug action from group-id ack-message-id)
+      #_(joined-chat-message group-id from ack-message-id))))
+
+(register-handler :participant-removed-from-group
+  (u/side-effect!
+    (fn [{:keys [current-public-key chats]}
+         [_ {:keys                                              [from]
+             {:keys [group-id identity message-id] :as payload} :payload
+             :as                                                message}]]
+      (when-not (messages/get-by-id message-id)
+        (let [admin (get-in chats [group-id :group-admin])]
+          (when (= admin from)
+            (if (= current-public-key identity)
+              (dispatch [::you-removed-from-group message])
+              (let [message
+                    (assoc
+                      (participant-removed-from-group-message identity from payload)
+                      :group-id group-id)]
+                (chats/remove-contacts group-id [identity])
+                (dispatch [:received-message message])))))))))
+
+(register-handler ::you-removed-from-group
+  (u/side-effect!
+    (fn [{:keys [web3]}
+         [_ {:keys                                    [from]
+             {:keys [group-id timestamp] :as payload} :payload}]]
+      (when (chats/new-update? timestamp group-id)
+        (let [message  (you-removed-from-group-message from payload)
+              message' (assoc message :group-id group-id)]
+          (dispatch [:received-message message']))
+        (protocol/stop-watching-group! {:web3     web3
+                                        :group-id group-id})
+        (dispatch [:update-chat! {:chat-id         group-id
+                                  :removed-from-at timestamp
+                                  :is-active       false}])))))
+
+(register-handler :participant-left-group
+  (u/side-effect!
+    (fn [{:keys [current-public-key]}
+         [_ {:keys                                    [from]
+             {:keys [group-id timestamp] :as payload} :payload}]]
+      (when (and (not= current-public-key from)
+                 (chats/is-active? group-id)
+                 (> timestamp (chats/get-property group-id :timestamp)))
+        (participant-left-group-message group-id from payload)
+        (dispatch [::remove-identity-from-chat group-id from])
+        (dispatch [::remove-identity-from-chat! group-id from])))))
+
+(register-handler ::remove-identity-from-chat
+  (fn [db [_ chat-id id]]
+    (update-in db [:chats chat-id :contacts]
+               #(remove (fn [{:keys [identity]}]
+                          (= identity id)) %))))
+
+(register-handler ::remove-identity-from-chat!
+  (u/side-effect!
+    (fn [_ [_ group-id identity]]
+      (chats/remove-contacts group-id [identity]))))
+
+(register-handler :participant-invited-to-group
+  (u/side-effect!
+    (fn [{:keys [current-public-key chats]}
+         [_ {:keys                                            [from]
+             {:keys [group-id identity message-id timestamp]} :payload}]]
+      (let [admin (get-in chats [group-id :group-admin])]
+        (when (= from admin)
+          (dispatch
+            [:received-message
+             (participant-invited-to-group-message group-id current-public-key identity from message-id timestamp)])
+          (when-not (= current-public-key identity)
+            (dispatch [:add-contact-to-group! group-id identity])))))))
+
+(register-handler :add-contact-to-group!
+  (u/side-effect!
+    (fn [_ [_ group-id identity]]
+      (when-not (chats/has-contact? group-id identity)
+        (dispatch [::add-contact group-id identity])
+        (dispatch [::store-contact! group-id identity])))))
+
+(register-handler ::add-contact
+  (fn [db [_ group-id identity]]
+    (update-in db [:chats group-id :contacts] conj {:identity identity})))
+
+(register-handler ::store-contact!
+  (u/side-effect!
+    (fn [_ [_ group-id identity]]
+      (chats/add-contacts group-id [identity]))))
+
+(defn save-message-object! [object]
+  (fn [_ [_
+          {:keys                                        [from]
+           {:keys [message-id ack-of-message group-id]} :payload}]]
+    (let [message-id' (or ack-of-message message-id)]
+      (when-let [{:keys [message-object] :as message} (messages/get-by-id message-id')]
+        (when-not (= (keyword message-object) :seen)
+          (let [group?  (boolean group-id)
+                message (if (and group? (not= object :sent))
+                          (update-in message
+                                     [:user-objectes from]
+                                     (fn [{old-object :object}]
+                                       {:id               (random/id)
+                                        :whisper-identity from
+                                        :object           (if (= (keyword old-object) :seen)
+                                                            old-object
+                                                            object)}))
+                          (assoc message :message-object object))]
+            (messages/update message)))))))
+
+(defn update-message-object [object]
+  (fn [db
+       [_ {:keys                                        [from]
+           {:keys [message-id ack-of-message group-id]} :payload}]]
+    (if (chats/is-active? (or group-id from))
+      (let [message-id' (or ack-of-message message-id)
+            group?      (boolean group-id)
+            object-path (if (and group? (not= object :sent))
+                          [:message-data :user-objectes message-id' from]
+                          [:message-data :objectes message-id'])
+            {current-object :object} (get-in db object-path)]
+        (if-not (= :seen current-object)
+          (assoc-in db object-path {:whisper-identity from
+                                    :object           object})
+          db))
+      db)))
+
+(defn remove-pending-message
+  [_ [_ message]]
+  (dispatch [:pending-message-remove message]))
+
+(register-handler :message-delivered
+  [(after (save-message-object! :delivered))
+   (after remove-pending-message)]
+  (update-message-object :delivered))
+
+(register-handler :message-failed
+  (after (save-message-object! :failed))
+  (update-message-object :failed))
+
+(register-handler :message-sent
+  (after (save-message-object! :sent))
+  (update-message-object :sent))
+
+(register-handler :message-seen
+  [(after (save-message-object! :seen))]
+  (update-message-object :seen))
+
+(register-handler :pending-message-upsert
+  (after
+    (fn [_ [_ {:keys [type id] :as pending-message}]]
+      (pending-messages/save pending-message)
+      (when (#{:message :group-message} type)
+        (messages/update {:message-id      id
+                          :delivery-object :pending}))))
+  (fn [db [_ {:keys [type id to group-id]}]]
+    (if (#{:message :group-message} type)
+      (let [chat-id        (or group-id to)
+            current-object (get-in db [:message-object chat-id id])]
+        (if-not (= :seen current-object)
+          (assoc-in db [:message-object chat-id id] :pending)
+          db))
+      db)))
+
+(register-handler :pending-message-remove
+  (u/side-effect!
+    (fn [_ [_ message]]
+      (pending-messages/delete message))))
+
+(register-handler :contact-request-received
+  (u/side-effect!
+    (fn [{:contacts/keys [contacts]} [_ {:keys [from payload]}]]
+      (when from
+        (let [{{:keys [name profile-image address object]} :contact
+               {:keys [public private]}                    :keypair} payload
+              existing-contact (get contacts from)
+              contact          {:whisper-identity from
+                                :public-key       public
+                                :private-key      private
+                                :address          address
+                                :object           object
+                                :photo-path       profile-image
+                                :name             name}
+              chat             {:name         name
+                                :chat-id      from
+                                :contact-info (prn-str contact)}]
+          (if-not existing-contact
+            (let [contact (assoc contact :pending? true)]
+              (dispatch [:add-contacts [contact]])
+              (dispatch [:add-chat from chat]))
+            (when-not (:pending? existing-contact)
+              (dispatch [:update-contact! contact])
+              (dispatch [:update-chat! chat])
+              (dispatch [:watch-contact contact]))))))))
+
+(register-handler ::post-error
+  (u/side-effect!
+    (fn [_ [_ error]]
+      (.log js/console error)
+      (let [message        (.-message error)
+            ios-error?     (re-find (re-pattern "Could not connect to the server.") message)
+            android-error? (re-find (re-pattern "Failed to connect") message)]
+        (when (or ios-error? android-error?)
+          (when android-error? (object/init-jail))
+          (object/restart-rpc)
+          (dispatch [:load-commands!]))))))

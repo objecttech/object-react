@@ -1,0 +1,136 @@
+(ns objecttech.chat.views.actions
+  (:require-macros [objecttech.utils.views :refer [defview letsubs]])
+  (:require [re-frame.core :refer [subscribe dispatch]]
+            [clojure.string :as s]
+            [objecttech.components.react :refer [view
+                                                animated-view
+                                                text
+                                                icon
+                                                touchable-highlight
+                                                list-view
+                                                list-item]]
+            [objecttech.components.chat-icon.screen :refer [chat-icon-view-menu-item]]
+            [objecttech.chat.styles.screen :as st]
+            [objecttech.i18n :refer [label label-pluralize]]
+            [objecttech.utils.platform :refer [platform-specific]]))
+
+(defview menu-item-icon-profile []
+  [chat-id [:chat :chat-id]
+   group-chat [:chat :group-chat]
+   name [:chat :name]
+   color [:chat :color]]
+  ;; TODO stub data ('online' property)
+  [chat-icon-view-menu-item chat-id group-chat name color true])
+
+(defn- members-text [members]
+  (str (s/join ", " (map :name members))
+       " "
+       (label :t/and-you)))
+
+(defn item-members [members]
+  {:title      (label :t/members-title)
+   :subtitle   (members-text members)
+   :icon       :menu_group
+   :icon-style {:width  25
+                :height 19}
+   ;; TODO not implemented: action Members
+   :handler    nil})
+
+(defn item-user [chat-id]
+  {:title       (label :t/profile)
+   :custom-icon [menu-item-icon-profile]
+   :icon        :menu_group
+   :icon-style  {:width  25
+                 :height 19}
+   :handler     #(dispatch [:show-profile chat-id])})
+
+(def item-search
+  {:title      (label :t/search-chat)
+   :subtitle   (label :t/not-implemented)
+   :icon       :search_gray_copy
+   :icon-style {:width  17
+                :height 17}
+   ;; TODO not implemented: action Search chat
+   :handler    nil})
+
+(def item-notifications
+  {:title      (label :t/notifications-title)
+   :subtitle   (label :t/not-implemented)
+   ;;:subtitle   "Chat muted"
+   :icon       :muted
+   :icon-style {:width  18
+                :height 21}
+   ;; TODO not implemented: action Notifications
+   :handler    nil})
+
+(def item-settings
+  {:title      (label :t/settings)
+   :icon       :settings
+   :icon-style {:width  20
+                :height 13}
+   :handler    #(dispatch [:show-group-chat-settings])})
+
+(defn group-chat-items [members public?]
+  (into (if public? [] [(item-members members)])
+        [item-search
+         item-notifications
+         item-settings]))
+
+(defn user-chat-items [chat-id]
+  [(item-user chat-id)
+   item-search
+   item-notifications])
+
+(defn overlay [{:keys [on-click-outside]} items]
+  [view st/actions-overlay
+   [touchable-highlight {:on-press on-click-outside
+                         :style    st/overlay-highlight}
+    [view nil]]
+   items])
+
+(defn action-view [{:keys     [icon-style
+                               custom-icon
+                               handler
+                               title
+                               subtitle]
+                    icon-name :icon}]
+  [touchable-highlight {:on-press (fn []
+                                    (dispatch [:set-chat-ui-props {:show-actions? false}])
+                                    (when handler
+                                      (handler)))}
+   [view st/action-icon-row
+    [view st/action-icon-view
+     (or custom-icon
+         [icon icon-name icon-style])]
+    [view st/action-view
+     [text {:style           st/action-title
+            :number-of-lines 1
+            :font            :medium}
+      title]
+     (when-let [subtitle subtitle]
+       [text {:style           st/action-subtitle
+              :number-of-lines 1
+              :font            :default}
+        subtitle])]]])
+
+(defview actions-list-view []
+  (letsubs [group-chat        [:chat :group-chat]
+            chat-id           [:chat :chat-id]
+            public?           [:chat :public?]
+            members           [:current-chat-contacts]
+            object-bar-height (get-in platform-specific [:component-styles :object-bar :default :height])]
+    (when-let [actions (if group-chat
+                         (group-chat-items members public?)
+                         (user-chat-items chat-id))]
+      [view (merge
+              (st/actions-wrapper object-bar-height)
+              (get-in platform-specific [:component-styles :actions-list-view]))
+       [view st/actions-separator]
+       [view st/actions-view
+        (for [action actions]
+          (if action
+            ^{:key action} [action-view action]))]])))
+
+(defn actions-view []
+  [overlay {:on-click-outside #(dispatch [:set-chat-ui-props {:show-actions? false}])}
+   [actions-list-view]])
